@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -45,6 +46,7 @@ import (
 	"github.com/prometheus/prometheus/prompb"
 	"github.com/prometheus/prometheus/promql/promqltest"
 	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/tsdbutil"
 	"github.com/prometheus/prometheus/util/teststorage"
@@ -352,14 +354,30 @@ func BenchmarkStreamReadEndpoint(b *testing.B) {
 			externalLabels labels.Labels
 			// Whether the series have a label that sorts after the external labels.
 			lastLabelAfter bool
+			// Whether series of another metric have the cluster label.
+			otherMetricCluster bool
+			// Whether every second series has its own cluster label.
+			ownCluster bool
+			// Whether to read from a block instead of the head.
+			block bool
 		}{
 			{name: "external_labels_none"},
 			{name: "external_labels_after_last_label", externalLabels: labels.FromStrings("cluster", "c1", "replica", "r1")},
 			{name: "external_labels_before_last_label", externalLabels: labels.FromStrings("cluster", "c1", "replica", "r1"), lastLabelAfter: true},
+			{name: "external_label_on_other_metric", externalLabels: labels.FromStrings("cluster", "c1", "replica", "r1"), otherMetricCluster: true},
+			{name: "external_label_on_other_metric_block", externalLabels: labels.FromStrings("cluster", "c1", "replica", "r1"), otherMetricCluster: true, block: true},
+			{name: "external_label_on_half", externalLabels: labels.FromStrings("cluster", "c1", "replica", "r1"), ownCluster: true},
+			{name: "external_label_on_half_block", externalLabels: labels.FromStrings("cluster", "c1", "replica", "r1"), ownCluster: true, block: true},
 		} {
 			b.Run(fmt.Sprintf("series_%d/%s", seriesCount, tc.name), func(b *testing.B) {
 				store := teststorage.New(b)
 				app := store.AppenderV2(b.Context())
+				appendSeries := func(lset labels.Labels) {
+					for ts := range 240 {
+						_, err := app.Append(0, lset, 0, int64(ts)*60000, float64(ts), nil, nil, storage.AOptions{})
+						require.NoError(b, err)
+					}
+				}
 				for i := range seriesCount {
 					labelStrings := []string{"__name__", "test_metric", "instance", strconv.Itoa(i), "job", "test"}
 					for j := range 8 {
@@ -368,13 +386,20 @@ func BenchmarkStreamReadEndpoint(b *testing.B) {
 					if tc.lastLabelAfter {
 						labelStrings = append(labelStrings, "zone", "z1")
 					}
-					lset := labels.FromStrings(labelStrings...)
-					for ts := range 240 {
-						_, err := app.Append(0, lset, 0, int64(ts)*60000, float64(ts), nil, nil, storage.AOptions{})
-						require.NoError(b, err)
+					if tc.ownCluster && i%2 == 0 {
+						labelStrings = append(labelStrings, "cluster", "c2")
+					}
+					appendSeries(labels.FromStrings(labelStrings...))
+					if tc.otherMetricCluster {
+						appendSeries(labels.FromStrings("__name__", "other_metric", "cluster", "c2", "instance", strconv.Itoa(i)))
 					}
 				}
 				require.NoError(b, app.Commit())
+				if tc.block {
+					head := store.Head()
+					require.NoError(b, store.CompactHead(tsdb.NewRangeHead(head, head.MinTime(), head.MaxTime())))
+					require.Len(b, store.Blocks(), 1)
+				}
 
 				bench(b, store, tc.externalLabels, "test_metric", 1<<20, seriesCount)
 			})
@@ -952,6 +977,287 @@ func TestStreamReadEndpoint(t *testing.T) {
 			})
 		}
 	})
+}
+
+// Test for https://github.com/prometheus/prometheus/issues/12605: series that
+// already have a label named like an external label keep their own value, series
+// that end up with the same labels are returned as one, and a streamed response
+// stays sorted.
+func TestRemoteReadSortedResult(t *testing.T) {
+	issueData := `
+		load 30s
+			aaa{instance="bbb", job="etcd", service="etcd", toposphere="test1"} 1 _ 1
+			aaa{instance="bbb", job="etcd", region="bar", service="etcd", toposphere="test1"} 2
+			aaa{instance="bbb", job="etcd", region="bar", service="etcd", toposphere="test2"} 3
+			aaa{instance="bbb", job="etcd", region="foo", service="etcd", toposphere="test1"} _ 4
+			aaa{instance="bbb", job="etcd", region="foo", service="etcd", toposphere="test2"} 5
+	`
+	type series struct {
+		Labels  labels.Labels
+		Samples []prompb.Sample
+	}
+	for _, tc := range []struct {
+		name string
+		load string
+		// Series of a remote read source behind the fanout storage, if any.
+		remoteLoad     string
+		externalLabels labels.Labels
+		matchers       []*labels.Matcher
+		expected       []series
+		// The matchers the remote read source has to be queried with.
+		expectedRemoteMatchers []*prompb.LabelMatcher
+	}{
+		{
+			name: "stored value differs",
+			load: `
+			load 30s
+				test_metric1{a="1", b="2", c="3"} 1
+				test_metric1{a="1", b="2", c="3", d="4"} 2
+				test_metric1{a="1", c="5"} 3
+				test_metric1{a="1", c="6"} 4
+			`,
+			externalLabels: labels.FromStrings("b", "1"),
+			matchers:       []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "a", "1")},
+			expected: []series{
+				{labels.FromStrings("__name__", "test_metric1", "a", "1", "b", "1", "c", "5"), []prompb.Sample{{Value: 3}}},
+				{labels.FromStrings("__name__", "test_metric1", "a", "1", "b", "1", "c", "6"), []prompb.Sample{{Value: 4}}},
+				{labels.FromStrings("__name__", "test_metric1", "a", "1", "b", "2", "c", "3"), []prompb.Sample{{Value: 1}}},
+				{labels.FromStrings("__name__", "test_metric1", "a", "1", "b", "2", "c", "3", "d", "4"), []prompb.Sample{{Value: 2}}},
+			},
+		},
+		{
+			name:           "stored value differs or equals",
+			load:           issueData,
+			externalLabels: labels.FromStrings("region", "foo"),
+			matchers:       []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "__name__", "aaa")},
+			expected: []series{
+				{labels.FromStrings("__name__", "aaa", "instance", "bbb", "job", "etcd", "region", "bar", "service", "etcd", "toposphere", "test1"), []prompb.Sample{{Value: 2}}},
+				{labels.FromStrings("__name__", "aaa", "instance", "bbb", "job", "etcd", "region", "bar", "service", "etcd", "toposphere", "test2"), []prompb.Sample{{Value: 3}}},
+				{labels.FromStrings("__name__", "aaa", "instance", "bbb", "job", "etcd", "region", "foo", "service", "etcd", "toposphere", "test1"), []prompb.Sample{{Value: 1}, {Value: 4, Timestamp: 30000}, {Value: 1, Timestamp: 60000}}},
+				{labels.FromStrings("__name__", "aaa", "instance", "bbb", "job", "etcd", "region", "foo", "service", "etcd", "toposphere", "test2"), []prompb.Sample{{Value: 5}}},
+			},
+		},
+		{
+			name: "stored value equals",
+			load: `
+			load 30s
+				aaa{job="etcd", toposphere="test0"} 1
+				aaa{job="etcd", toposphere="test1"} 2
+				aaa{job="etcd", region="foo", toposphere="test1"} 2
+				aaa{job="etcd", region="foo", toposphere="test2"} 3
+			`,
+			externalLabels: labels.FromStrings("region", "foo"),
+			matchers:       []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "__name__", "aaa")},
+			expected: []series{
+				{labels.FromStrings("__name__", "aaa", "job", "etcd", "region", "foo", "toposphere", "test0"), []prompb.Sample{{Value: 1}}},
+				{labels.FromStrings("__name__", "aaa", "job", "etcd", "region", "foo", "toposphere", "test1"), []prompb.Sample{{Value: 2}}},
+				{labels.FromStrings("__name__", "aaa", "job", "etcd", "region", "foo", "toposphere", "test2"), []prompb.Sample{{Value: 3}}},
+			},
+		},
+		{
+			name: "two external labels",
+			load: `
+			load 30s
+				ddd{job="a"} 1
+				ddd{cluster="c1", job="a", replica="r1"} _ 2
+				ddd{cluster="c2", job="a", replica="r1"} 3
+				ddd{job="b", replica="r2"} 4
+			`,
+			externalLabels: labels.FromStrings("cluster", "c1", "replica", "r1"),
+			matchers:       []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "__name__", "ddd")},
+			expected: []series{
+				{labels.FromStrings("__name__", "ddd", "cluster", "c1", "job", "a", "replica", "r1"), []prompb.Sample{{Value: 1}, {Value: 2, Timestamp: 30000}}},
+				{labels.FromStrings("__name__", "ddd", "cluster", "c1", "job", "b", "replica", "r2"), []prompb.Sample{{Value: 4}}},
+				{labels.FromStrings("__name__", "ddd", "cluster", "c2", "job", "a", "replica", "r1"), []prompb.Sample{{Value: 3}}},
+			},
+		},
+		{
+			name:           "every selected series has the label",
+			load:           issueData,
+			externalLabels: labels.FromStrings("region", "foo"),
+			matchers: []*labels.Matcher{
+				labels.MustNewMatcher(labels.MatchEqual, "__name__", "aaa"),
+				labels.MustNewMatcher(labels.MatchEqual, "region", "bar"),
+			},
+			expected: []series{
+				{labels.FromStrings("__name__", "aaa", "instance", "bbb", "job", "etcd", "region", "bar", "service", "etcd", "toposphere", "test1"), []prompb.Sample{{Value: 2}}},
+				{labels.FromStrings("__name__", "aaa", "instance", "bbb", "job", "etcd", "region", "bar", "service", "etcd", "toposphere", "test2"), []prompb.Sample{{Value: 3}}},
+			},
+		},
+		{
+			name: "every selected series has the label without a matcher for it",
+			load: `
+			load 30s
+				ccc{job="a", region="bar"} 1
+				ccc{job="b", region="foo"} 2
+			`,
+			externalLabels: labels.FromStrings("region", "foo"),
+			matchers:       []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "__name__", "ccc")},
+			expected: []series{
+				{labels.FromStrings("__name__", "ccc", "job", "a", "region", "bar"), []prompb.Sample{{Value: 1}}},
+				{labels.FromStrings("__name__", "ccc", "job", "b", "region", "foo"), []prompb.Sample{{Value: 2}}},
+			},
+		},
+		{
+			name: "remote read source",
+			load: `
+			load 30s
+				x{job="a"} 1
+				x{job="a", region="bar"} 2
+			`,
+			remoteLoad: `
+			load 30s
+				x{job="r1", region="foo"} 3
+				x{job="r2", region="other"} 4
+				x{job="r3"} 5
+			`,
+			externalLabels: labels.FromStrings("region", "foo"),
+			matchers:       []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "__name__", "x")},
+			expected: []series{
+				{labels.FromStrings("__name__", "x", "job", "a", "region", "bar"), []prompb.Sample{{Value: 2}}},
+				{labels.FromStrings("__name__", "x", "job", "a", "region", "foo"), []prompb.Sample{{Value: 1}}},
+				{labels.FromStrings("__name__", "x", "job", "r1", "region", "foo"), []prompb.Sample{{Value: 3}}},
+			},
+			expectedRemoteMatchers: []*prompb.LabelMatcher{
+				{Type: prompb.LabelMatcher_EQ, Name: "__name__", Value: "x"},
+				{Type: prompb.LabelMatcher_EQ, Name: "region", Value: "foo"},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := promqltest.LoadedStorage(t, tc.load)
+			t.Cleanup(func() { require.NoError(t, store.Close()) })
+			var (
+				queryable storage.SampleAndChunkQueryable = store
+				client    *recordingReadClient
+			)
+			if tc.remoteLoad != "" {
+				remoteStore := promqltest.LoadedStorage(t, tc.remoteLoad)
+				t.Cleanup(func() { require.NoError(t, remoteStore.Close()) })
+				client = &recordingReadClient{queryable: remoteStore}
+				queryable = fanoutQueryable{
+					local: store,
+					// Like remote_read with read_recent: true and the default
+					// filter_external_labels: true.
+					remote: NewSampleAndChunkQueryableClient(client, tc.externalLabels, nil, true, func() (int64, error) { return 0, nil }),
+				}
+			}
+			handler := NewReadHandler(nil, nil, queryable, func() config.Config {
+				return config.Config{GlobalConfig: config.GlobalConfig{ExternalLabels: tc.externalLabels}}
+			}, 1e6, 1, 1<<20)
+			query, err := ToQuery(0, 60000, tc.matchers, nil)
+			require.NoError(t, err)
+
+			for _, responseType := range []prompb.ReadRequest_ResponseType{prompb.ReadRequest_STREAMED_XOR_CHUNKS, prompb.ReadRequest_SAMPLES} {
+				data, err := proto.Marshal(&prompb.ReadRequest{
+					Queries:               []*prompb.Query{query},
+					AcceptedResponseTypes: []prompb.ReadRequest_ResponseType{responseType},
+				})
+				require.NoError(t, err)
+				recorder := httptest.NewRecorder()
+				handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/api/v1/read", bytes.NewReader(snappy.Encode(nil, data))))
+				require.Equal(t, http.StatusOK, recorder.Code)
+
+				var got []series
+				if responseType == prompb.ReadRequest_STREAMED_XOR_CHUNKS {
+					body := recorder.Result().Body
+					ss := NewChunkedSeriesSet(NewChunkedReader(body, config.DefaultChunkedReadLimit, nil), body, 0, 60000, func(error) {})
+					for ss.Next() {
+						var samples []prompb.Sample
+						iter := ss.At().Iterator(nil)
+						for iter.Next() == chunkenc.ValFloat {
+							ts, value := iter.At()
+							samples = append(samples, prompb.Sample{Value: value, Timestamp: ts})
+						}
+						require.NoError(t, iter.Err())
+						got = append(got, series{ss.At().Labels(), samples})
+					}
+					require.NoError(t, ss.Err())
+					for i := 1; i < len(got); i++ {
+						require.Negative(t, labels.Compare(got[i-1].Labels, got[i].Labels), "series %d is not sorted after series %d", i, i-1)
+					}
+				} else {
+					uncompressed, err := snappy.Decode(nil, recorder.Body.Bytes())
+					require.NoError(t, err)
+					var resp prompb.ReadResponse
+					require.NoError(t, proto.Unmarshal(uncompressed, &resp))
+					require.Len(t, resp.Results, 1)
+					builder := labels.NewScratchBuilder(0)
+					for _, ts := range resp.Results[0].Timeseries {
+						got = append(got, series{ts.ToLabels(&builder, nil), ts.Samples})
+					}
+					// A samples response is not sorted.
+					slices.SortFunc(got, func(a, b series) int { return labels.Compare(a.Labels, b.Labels) })
+				}
+				testutil.RequireEqual(t, tc.expected, got, "response type %s", responseType)
+			}
+			if client != nil {
+				require.NotEmpty(t, client.queries)
+				for _, q := range client.queries {
+					require.Equal(t, tc.expectedRemoteMatchers, q.Matchers)
+				}
+			}
+		})
+	}
+}
+
+// recordingReadClient is a ReadClient that answers from a queryable and records
+// the queries it gets.
+type recordingReadClient struct {
+	queryable storage.Queryable
+	queries   []*prompb.Query
+}
+
+func (c *recordingReadClient) Read(ctx context.Context, query *prompb.Query, sortSeries bool) (storage.SeriesSet, error) {
+	c.queries = append(c.queries, query)
+	matchers, err := FromLabelMatchers(query.Matchers)
+	if err != nil {
+		return nil, err
+	}
+	querier, err := c.queryable.Querier(query.StartTimestampMs, query.EndTimestampMs)
+	if err != nil {
+		return nil, err
+	}
+	defer querier.Close()
+	res, _, err := ToQueryResult(querier.Select(ctx, sortSeries, nil, matchers...), 0)
+	if err != nil {
+		return nil, err
+	}
+	return FromQueryResult(sortSeries, res), nil
+}
+
+func (*recordingReadClient) ReadMultiple(context.Context, []*prompb.Query, bool) (storage.SeriesSet, error) {
+	return nil, errors.New("not implemented")
+}
+
+// fanoutQueryable queries local storage and a remote read source like the fanout
+// storage does.
+type fanoutQueryable struct {
+	local, remote storage.SampleAndChunkQueryable
+}
+
+func (f fanoutQueryable) Querier(mint, maxt int64) (storage.Querier, error) {
+	local, err := f.local.Querier(mint, maxt)
+	if err != nil {
+		return nil, err
+	}
+	remote, err := f.remote.Querier(mint, maxt)
+	if err != nil {
+		return nil, err
+	}
+	return storage.NewMergeQuerier([]storage.Querier{local}, []storage.Querier{remote}, storage.ChainedSeriesMerge), nil
+}
+
+func (f fanoutQueryable) ChunkQuerier(mint, maxt int64) (storage.ChunkQuerier, error) {
+	local, err := f.local.ChunkQuerier(mint, maxt)
+	if err != nil {
+		return nil, err
+	}
+	remote, err := f.remote.ChunkQuerier(mint, maxt)
+	if err != nil {
+		return nil, err
+	}
+	return storage.NewMergeChunkQuerier([]storage.ChunkQuerier{local}, []storage.ChunkQuerier{remote}, storage.NewCompactingChunkSeriesMerger(storage.ChainedSeriesMerge)), nil
 }
 
 type failingChunkQueryable struct {
