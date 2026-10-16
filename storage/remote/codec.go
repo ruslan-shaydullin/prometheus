@@ -238,16 +238,15 @@ func StreamChunkedReadResponses(
 	marshalPool *sync.Pool,
 ) (annotations.Annotations, error) {
 	var (
-		chks []prompb.Chunk
-		buf  []prompb.Label
-		iter chunks.Iterator
-		// Series that a later series may sort before, each one sorting before
-		// the one below it.
-		held         []heldChunkSeries
-		lastExtLabel string
+		chks  []prompb.Chunk
+		buf   []prompb.Label
+		iter  chunks.Iterator
+		order = externalLabelsOrder[labeledChunkSeries]{
+			compare: func(a, b labeledChunkSeries) int { return compareLabels(a.lbls, b.lbls) },
+		}
 	)
 	if len(sortedExternalLabels) > 0 {
-		lastExtLabel = sortedExternalLabels[len(sortedExternalLabels)-1].Name
+		order.lastName = sortedExternalLabels[len(sortedExternalLabels)-1].Name
 	}
 
 	write := func(series storage.ChunkSeries, lbls []prompb.Label) error {
@@ -311,50 +310,104 @@ func StreamChunkedReadResponses(
 	for ss.Next() {
 		series := ss.At()
 		buf = prompb.FromLabels(series.Labels(), buf)
-		lbls := MergeLabels(buf, sortedExternalLabels)
-
-		// Write the held series that sort before this one.
-		for len(held) > 0 && compareLabels(held[len(held)-1].lbls, lbls) < 0 {
-			h := held[len(held)-1]
-			held[len(held)-1] = heldChunkSeries{}
-			held = held[:len(held)-1]
-			if err := write(h.series, h.lbls); err != nil {
-				return ss.Warnings(), err
-			}
-		}
-
-		// With the external label c="3" added, x{a="1", b="2"} sorts before
-		// x{a="1"}, so x{a="1"} is held until no later series can sort before it.
-		// Only a later series with all the labels of this one and more can, if
-		// its first additional label is named before the last external label.
-		// Holding a series does not read its chunks.
 		var lastName string
 		if len(buf) > 0 {
 			lastName = buf[len(buf)-1].Name
 		}
-		if lastName < lastExtLabel {
-			held = append(held, heldChunkSeries{series: series, lbls: lbls})
-			continue
-		}
-		if err := write(series, lbls); err != nil {
-			return ss.Warnings(), err
+		order.add(labeledChunkSeries{series: series, lbls: MergeLabels(buf, sortedExternalLabels)}, lastName)
+		for s, ok := order.next(); ok; s, ok = order.next() {
+			if err := write(s.series, s.lbls); err != nil {
+				return ss.Warnings(), err
+			}
 		}
 	}
 	if err := ss.Err(); err != nil {
 		return ss.Warnings(), err
 	}
-	for _, h := range slices.Backward(held) {
-		if err := write(h.series, h.lbls); err != nil {
+	order.flush()
+	for s, ok := order.next(); ok; s, ok = order.next() {
+		if err := write(s.series, s.lbls); err != nil {
 			return ss.Warnings(), err
 		}
 	}
 	return ss.Warnings(), nil
 }
 
-// heldChunkSeries is a series held back, with the labels to stream it with.
-type heldChunkSeries struct {
+// labeledChunkSeries is a series with the labels to stream it with.
+type labeledChunkSeries struct {
 	series storage.ChunkSeries
 	lbls   []prompb.Label
+}
+
+// externalLabelsOrder orders series that get the same external labels added.
+// Adding the same labels keeps the order of the series, except when the labels
+// of a series are a prefix of the labels of a later series: with the external
+// label c="3", x{a="1", b="2"} sorts before x{a="1"}. Such a series is held
+// until no later series can sort before it. Holding a series does not read its
+// data.
+type externalLabelsOrder[T any] struct {
+	// compare compares two series by their labels with the external labels.
+	compare func(a, b T) int
+	// lastName is the name of the last external label.
+	lastName string
+	// held are the series that a later series may sort before, each one sorting
+	// before the one below it. ready are the series to return, in order, and
+	// then last if hasLast is set.
+	held, ready []T
+	readyIdx    int
+	last        T
+	hasLast     bool
+}
+
+// add adds the next series of a set sorted by the labels the series have,
+// lastName being the name of the last of those labels. The series that next
+// returns must be taken before adding another one.
+func (o *externalLabelsOrder[T]) add(s T, lastName string) {
+	for len(o.held) > 0 && o.compare(o.held[len(o.held)-1], s) < 0 {
+		o.ready = append(o.ready, o.unhold())
+	}
+	// Only a later series with all the labels of this one and more can sort
+	// before it, if its first additional label is named before the last
+	// external label.
+	if lastName < o.lastName {
+		o.held = append(o.held, s)
+		return
+	}
+	o.last, o.hasLast = s, true
+}
+
+// flush makes the held series ready once there are no more series to add.
+func (o *externalLabelsOrder[T]) flush() {
+	for len(o.held) > 0 {
+		o.ready = append(o.ready, o.unhold())
+	}
+}
+
+// next returns the next series in order, if any is ready.
+func (o *externalLabelsOrder[T]) next() (T, bool) {
+	var zero T
+	if o.readyIdx < len(o.ready) {
+		s := o.ready[o.readyIdx]
+		o.ready[o.readyIdx] = zero
+		o.readyIdx++
+		return s, true
+	}
+	o.ready, o.readyIdx = o.ready[:0], 0
+	if o.hasLast {
+		s := o.last
+		o.last, o.hasLast = zero, false
+		return s, true
+	}
+	return zero, false
+}
+
+// unhold removes the last held series and returns it.
+func (o *externalLabelsOrder[T]) unhold() T {
+	var zero T
+	s := o.held[len(o.held)-1]
+	o.held[len(o.held)-1] = zero
+	o.held = o.held[:len(o.held)-1]
+	return s
 }
 
 // compareLabels compares two sorted sets of proto labels like labels.Compare.
