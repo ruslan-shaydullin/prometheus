@@ -22,8 +22,12 @@ The `external_labels` setting in `global` affects remote read on both sides:
 - **Using remote read:** The querying Prometheus sends its own `external_labels` as additional equality matchers in the request, then strips them from the response.
 
 A streamed response (`STREAMED_XOR_CHUNKS`) returns the series sorted by their
-labels together with the external labels, unless some series already have a
-label with the name of an external label.
+labels together with the external labels. A response with samples is not
+sorted. A series that already has a label with the name of an external label,
+for example because of `honor_labels: true`, keeps its own value. Series of the
+local storage that end up with the same labels are returned as one series: their
+samples are interleaved, and of samples with the same timestamp only one is
+kept.
 
 If the querying Prometheus has `external_labels` that differ from or are absent on the remote server, queries may return no results because the matchers will not match. Ensure that any `external_labels` on the querying side are consistent with the labels present on the remote side.
 
