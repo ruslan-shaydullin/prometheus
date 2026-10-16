@@ -43,6 +43,7 @@ type readHandler struct {
 	remoteReadGate            *gate.Gate
 	queries                   prometheus.Gauge
 	gateWaitDuration          prometheus.Histogram
+	externalLabelConflicts    prometheus.Counter
 	marshalPool               *sync.Pool
 }
 
@@ -74,9 +75,15 @@ func NewReadHandler(logger *slog.Logger, r prometheus.Registerer, queryable stor
 			NativeHistogramMaxBucketNumber:  100,
 			NativeHistogramMinResetDuration: 1 * time.Hour,
 		}),
+		externalLabelConflicts: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Subsystem: "remote_read_handler",
+			Name:      "external_label_conflicts_total",
+			Help:      "The number of remote read queries that selected series with and without a label named like an external label.",
+		}),
 	}
 	if r != nil {
-		r.MustRegister(h.queries, h.gateWaitDuration)
+		r.MustRegister(h.queries, h.gateWaitDuration, h.externalLabelConflicts)
 	}
 	return h
 }
@@ -174,17 +181,33 @@ func (h *readHandler) remoteReadSamples(
 				}
 			}
 
+			var (
+				ss        storage.SeriesSet
+				extLabels = sortedExternalLabels
+			)
+			if keeps := h.externalLabelPartitions(ctx, querier, filteredMatchers, sortedExternalLabels); keeps != nil {
+				// Select every part before iterating any, as the fanout storage requires.
+				sets := make([]storage.SeriesSet, 0, len(keeps))
+				for _, keep := range keeps {
+					sets = append(sets, newExternalLabelsSeriesSet(querier.Select(ctx, true, hints, filteredMatchers...), keep, sortedExternalLabels, withSeriesLabels))
+				}
+				ss = storage.NewMergeSeriesSet(sets, 0, storage.ChainedSeriesMerge)
+				extLabels = nil
+			} else {
+				ss = querier.Select(ctx, false, hints, filteredMatchers...)
+			}
+
 			var ws annotations.Annotations
-			resp.Results[i], ws, err = ToQueryResult(querier.Select(ctx, false, hints, filteredMatchers...), h.remoteReadSampleLimit)
+			resp.Results[i], ws, err = ToQueryResult(ss, h.remoteReadSampleLimit)
 			if err != nil {
 				return err
 			}
 			for _, w := range ws {
 				h.logger.Warn("Warnings on remote read query", "err", w.Error())
 			}
-			if len(sortedExternalLabels) > 0 {
+			if len(extLabels) > 0 {
 				for _, ts := range resp.Results[i].Timeseries {
-					ts.Labels = MergeLabels(ts.Labels, sortedExternalLabels)
+					ts.Labels = MergeLabels(ts.Labels, extLabels)
 				}
 			}
 			return nil
@@ -246,12 +269,28 @@ func (h *readHandler) remoteReadStreamedXORChunks(ctx context.Context, w http.Re
 				}
 			}
 
+			var (
+				ss        storage.ChunkSeriesSet
+				extLabels = sortedExternalLabels
+			)
+			if keeps := h.externalLabelPartitions(ctx, querier, filteredMatchers, sortedExternalLabels); keeps != nil {
+				// Select every part before iterating any, as the fanout storage requires.
+				sets := make([]storage.ChunkSeriesSet, 0, len(keeps))
+				for _, keep := range keeps {
+					sets = append(sets, newExternalLabelsSeriesSet(querier.Select(ctx, true, hints, filteredMatchers...), keep, sortedExternalLabels, withChunkSeriesLabels))
+				}
+				ss = storage.NewMergeChunkSeriesSet(sets, 0, storage.NewCompactingChunkSeriesMerger(storage.ChainedSeriesMerge))
+				extLabels = nil
+			} else {
+				ss = querier.Select(ctx, true, hints, filteredMatchers...)
+			}
+
 			ws, err := StreamChunkedReadResponses(
 				cw,
 				int64(i),
 				// The streaming API has to provide the series sorted.
-				querier.Select(ctx, true, hints, filteredMatchers...),
-				sortedExternalLabels,
+				ss,
+				extLabels,
 				h.remoteReadMaxBytesInFrame,
 				h.marshalPool,
 			)
@@ -317,4 +356,187 @@ func filterExtLabelsFromMatchers(pbMatchers []*prompb.LabelMatcher, externalLabe
 	}
 
 	return filteredMatchers, nil
+}
+
+// externalLabelPartitions returns filters that split the series selected by
+// matchers into parts that get the same external labels added, or nil when all
+// of them do. A series that already has a label named like an external label
+// keeps its own value (see honor_labels), so the series that have it and the
+// series that do not get different labels added and do not stay in order. Each
+// part is selected and ordered on its own, and merging the parts also returns
+// series that end up with the same labels as one series.
+func (h *readHandler) externalLabelPartitions(ctx context.Context, querier storage.LabelQuerier, matchers []*labels.Matcher, sortedExternalLabels []prompb.Label) []func(labels.Labels) bool {
+	if len(sortedExternalLabels) == 0 {
+		return nil
+	}
+	// The label queries below drop warnings: a remote read source behind the
+	// fanout storage does not implement them and warns about it every time. An
+	// error falls back to selecting all series together.
+	fail := func(err error) []func(labels.Labels) bool {
+		if h.logger != nil {
+			h.logger.Debug("Selecting series together after failing to query external label names", "err", err)
+		}
+		return nil
+	}
+
+	// The names of the external labels that some of the selected series have.
+	var names []string
+	for _, l := range sortedExternalLabels {
+		if slices.ContainsFunc(matchers, func(m *labels.Matcher) bool {
+			// The matcher selects only series with the label, or only series without it.
+			return m.Name == l.Name && (!m.Matches("") || m.Type == labels.MatchEqual && m.Value == "")
+		}) {
+			continue
+		}
+		values, _, err := querier.LabelValues(ctx, l.Name, &storage.LabelHints{Limit: 1}, matchers...)
+		if err != nil {
+			return fail(err)
+		}
+		if len(values) > 0 {
+			names = append(names, l.Name)
+		}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+
+	// One part for each combination of having and not having those labels
+	// that some of the selected series have. The parts are selected with the
+	// same matchers and filtered afterwards, so that a remote read source
+	// behind the fanout storage still gets its external labels as matchers.
+	var keeps []func(labels.Labels) bool
+	// Bit i of has tells whether the series of a part have the label names[i].
+	for has := range 1 << len(names) {
+		ms := make([]*labels.Matcher, 0, len(matchers)+len(names))
+		ms = append(ms, matchers...)
+		for i, name := range names {
+			typ := labels.MatchEqual
+			if has&(1<<i) != 0 {
+				typ = labels.MatchNotEqual
+			}
+			ms = append(ms, labels.MustNewMatcher(typ, name, ""))
+		}
+		found, _, err := querier.LabelNames(ctx, &storage.LabelHints{Limit: 1}, ms...)
+		if err != nil {
+			return fail(err)
+		}
+		if len(found) == 0 {
+			continue
+		}
+		keeps = append(keeps, func(lset labels.Labels) bool {
+			for i, name := range names {
+				if lset.Has(name) != (has&(1<<i) != 0) {
+					return false
+				}
+			}
+			return true
+		})
+	}
+	if len(keeps) < 2 {
+		return nil
+	}
+	h.externalLabelConflicts.Inc()
+	return keeps
+}
+
+// seriesSet is a storage.SeriesSet or a storage.ChunkSeriesSet.
+type seriesSet[T storage.Labels] interface {
+	Next() bool
+	At() T
+	Err() error
+	Warnings() annotations.Annotations
+}
+
+// externalLabelsSeriesSet adds external labels to the series of a set sorted
+// by labels, keeping the labels a series already has, and returns the series
+// sorted by the resulting labels. It skips the series that keep returns false
+// for, and all the other series must have the same external label names.
+type externalLabelsSeriesSet[T storage.Labels] struct {
+	set                  seriesSet[T]
+	keep                 func(labels.Labels) bool
+	sortedExternalLabels []prompb.Label
+	withLabels           func(T, labels.Labels) T
+	builder              labels.Builder
+	order                externalLabelsOrder[T]
+	cur                  T
+	done                 bool
+}
+
+// newExternalLabelsSeriesSet returns an externalLabelsSeriesSet. withLabels
+// returns a series with other labels, and sortedExternalLabels must not be
+// empty.
+func newExternalLabelsSeriesSet[T storage.Labels](set seriesSet[T], keep func(labels.Labels) bool, sortedExternalLabels []prompb.Label, withLabels func(T, labels.Labels) T) *externalLabelsSeriesSet[T] {
+	return &externalLabelsSeriesSet[T]{
+		set:                  set,
+		keep:                 keep,
+		sortedExternalLabels: sortedExternalLabels,
+		withLabels:           withLabels,
+		order: externalLabelsOrder[T]{
+			compare:  func(a, b T) int { return labels.Compare(a.Labels(), b.Labels()) },
+			lastName: sortedExternalLabels[len(sortedExternalLabels)-1].Name,
+		},
+	}
+}
+
+func (s *externalLabelsSeriesSet[T]) Next() bool {
+	for {
+		if series, ok := s.order.next(); ok {
+			s.cur = series
+			return true
+		}
+		if s.done {
+			return false
+		}
+		if !s.set.Next() {
+			s.done = true
+			s.order.flush()
+			continue
+		}
+		series := s.set.At()
+		lset := series.Labels()
+		if !s.keep(lset) {
+			continue
+		}
+		var lastName string
+		lset.Range(func(l labels.Label) { lastName = l.Name })
+		s.builder.Reset(lset)
+		for _, l := range s.sortedExternalLabels {
+			if !lset.Has(l.Name) {
+				s.builder.Set(l.Name, l.Value)
+			}
+		}
+		s.order.add(s.withLabels(series, s.builder.Labels()), lastName)
+	}
+}
+
+func (s *externalLabelsSeriesSet[T]) At() T { return s.cur }
+
+func (s *externalLabelsSeriesSet[T]) Err() error { return s.set.Err() }
+
+func (s *externalLabelsSeriesSet[T]) Warnings() annotations.Annotations { return s.set.Warnings() }
+
+// seriesWithLabels is a series with other labels.
+type seriesWithLabels struct {
+	storage.Series
+	lset labels.Labels
+}
+
+func (s seriesWithLabels) Labels() labels.Labels { return s.lset }
+
+// withSeriesLabels returns s with the labels lset.
+func withSeriesLabels(s storage.Series, lset labels.Labels) storage.Series {
+	return seriesWithLabels{Series: s, lset: lset}
+}
+
+// chunkSeriesWithLabels is a chunk series with other labels.
+type chunkSeriesWithLabels struct {
+	storage.ChunkSeries
+	lset labels.Labels
+}
+
+func (s chunkSeriesWithLabels) Labels() labels.Labels { return s.lset }
+
+// withChunkSeriesLabels returns s with the labels lset.
+func withChunkSeriesLabels(s storage.ChunkSeries, lset labels.Labels) storage.ChunkSeries {
+	return chunkSeriesWithLabels{ChunkSeries: s, lset: lset}
 }

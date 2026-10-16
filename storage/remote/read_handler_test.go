@@ -1004,6 +1004,9 @@ func TestRemoteReadSortedResult(t *testing.T) {
 		externalLabels labels.Labels
 		matchers       []*labels.Matcher
 		expected       []series
+		// Whether some of the selected series have a label named like an
+		// external label and others do not.
+		expectedConflict bool
 		// The matchers the remote read source has to be queried with.
 		expectedRemoteMatchers []*prompb.LabelMatcher
 	}{
@@ -1024,6 +1027,7 @@ func TestRemoteReadSortedResult(t *testing.T) {
 				{labels.FromStrings("__name__", "test_metric1", "a", "1", "b", "2", "c", "3"), []prompb.Sample{{Value: 1}}},
 				{labels.FromStrings("__name__", "test_metric1", "a", "1", "b", "2", "c", "3", "d", "4"), []prompb.Sample{{Value: 2}}},
 			},
+			expectedConflict: true,
 		},
 		{
 			name:           "stored value differs or equals",
@@ -1036,6 +1040,7 @@ func TestRemoteReadSortedResult(t *testing.T) {
 				{labels.FromStrings("__name__", "aaa", "instance", "bbb", "job", "etcd", "region", "foo", "service", "etcd", "toposphere", "test1"), []prompb.Sample{{Value: 1}, {Value: 4, Timestamp: 30000}, {Value: 1, Timestamp: 60000}}},
 				{labels.FromStrings("__name__", "aaa", "instance", "bbb", "job", "etcd", "region", "foo", "service", "etcd", "toposphere", "test2"), []prompb.Sample{{Value: 5}}},
 			},
+			expectedConflict: true,
 		},
 		{
 			name: "stored value equals",
@@ -1053,6 +1058,7 @@ func TestRemoteReadSortedResult(t *testing.T) {
 				{labels.FromStrings("__name__", "aaa", "job", "etcd", "region", "foo", "toposphere", "test1"), []prompb.Sample{{Value: 2}}},
 				{labels.FromStrings("__name__", "aaa", "job", "etcd", "region", "foo", "toposphere", "test2"), []prompb.Sample{{Value: 3}}},
 			},
+			expectedConflict: true,
 		},
 		{
 			name: "two external labels",
@@ -1070,6 +1076,7 @@ func TestRemoteReadSortedResult(t *testing.T) {
 				{labels.FromStrings("__name__", "ddd", "cluster", "c1", "job", "b", "replica", "r2"), []prompb.Sample{{Value: 4}}},
 				{labels.FromStrings("__name__", "ddd", "cluster", "c2", "job", "a", "replica", "r1"), []prompb.Sample{{Value: 3}}},
 			},
+			expectedConflict: true,
 		},
 		{
 			name:           "every selected series has the label",
@@ -1118,6 +1125,7 @@ func TestRemoteReadSortedResult(t *testing.T) {
 				{labels.FromStrings("__name__", "x", "job", "a", "region", "foo"), []prompb.Sample{{Value: 1}}},
 				{labels.FromStrings("__name__", "x", "job", "r1", "region", "foo"), []prompb.Sample{{Value: 3}}},
 			},
+			expectedConflict: true,
 			expectedRemoteMatchers: []*prompb.LabelMatcher{
 				{Type: prompb.LabelMatcher_EQ, Name: "__name__", Value: "x"},
 				{Type: prompb.LabelMatcher_EQ, Name: "region", Value: "foo"},
@@ -1142,7 +1150,8 @@ func TestRemoteReadSortedResult(t *testing.T) {
 					remote: NewSampleAndChunkQueryableClient(client, tc.externalLabels, nil, true, func() (int64, error) { return 0, nil }),
 				}
 			}
-			handler := NewReadHandler(nil, nil, queryable, func() config.Config {
+			registry := prometheus.NewRegistry()
+			handler := NewReadHandler(nil, registry, queryable, func() config.Config {
 				return config.Config{GlobalConfig: config.GlobalConfig{ExternalLabels: tc.externalLabels}}
 			}, 1e6, 1, 1<<20)
 			query, err := ToQuery(0, 60000, tc.matchers, nil)
@@ -1191,6 +1200,15 @@ func TestRemoteReadSortedResult(t *testing.T) {
 				}
 				testutil.RequireEqual(t, tc.expected, got, "response type %s", responseType)
 			}
+			conflicts := 0
+			if tc.expectedConflict {
+				conflicts = 2
+			}
+			require.NoError(t, prom_testutil.GatherAndCompare(registry, strings.NewReader(fmt.Sprintf(
+				"# HELP prometheus_remote_read_handler_external_label_conflicts_total The number of remote read queries that selected series with and without a label named like an external label.\n"+
+					"# TYPE prometheus_remote_read_handler_external_label_conflicts_total counter\n"+
+					"prometheus_remote_read_handler_external_label_conflicts_total %d\n", conflicts,
+			)), "prometheus_remote_read_handler_external_label_conflicts_total"))
 			if client != nil {
 				require.NotEmpty(t, client.queries)
 				for _, q := range client.queries {

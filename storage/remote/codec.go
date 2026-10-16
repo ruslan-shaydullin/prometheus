@@ -228,7 +228,9 @@ func NegotiateResponseType(accepted []prompb.ReadRequest_ResponseType) (prompb.R
 // It expects Series set with populated chunks, sorted by labels. Each series gets
 // the external labels it does not have yet, and the series are streamed sorted by
 // the resulting labels, unless some of them already have a label named like an
-// external label.
+// external label. Callers that may select such series have to add the external
+// labels themselves, keep the series sorted by the resulting labels and pass nil
+// sortedExternalLabels, as the remote read handler does.
 func StreamChunkedReadResponses(
 	stream io.Writer,
 	queryIndex int64,
